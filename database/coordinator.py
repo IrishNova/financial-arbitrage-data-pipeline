@@ -23,7 +23,7 @@ from utils.logger import get_logger
 from broker.receiver import ZeroMQReceiver, MarketDataMessage, AnalysisMessage, TradeMessage
 from influx.writer import InfluxDBWriter
 from postgres.writer import PostgreSQLWriter
-from models.influx import MarketSnapshot, create_kalshi_snapshot, create_polymarket_snapshot
+from models.influx import MarketSnapshot, create_snapshot_from_virginia_data
 from models.postgres import TradeTicket, AnalysisRecord, ArbitragePair
 
 
@@ -70,7 +70,11 @@ class DataServerCoordinator:
             'records_written_postgres': 0,
             'processing_errors': 0,
             'last_message_time': 0,
-            'avg_processing_latency_ms': 0.0
+            'avg_processing_latency_ms': 0.0,
+            'kalshi_snapshots_processed': 0,
+            'kalshi_snapshots_written': 0,
+            'kalshi_conversion_errors': 0,
+            'kalshi_influx_write_errors': 0
         }
 
         # Processing latency tracking
@@ -143,7 +147,7 @@ class DataServerCoordinator:
         try:
             # Initialize ZeroMQ receiver
             self.logger.info("Initializing ZeroMQ receiver...")
-            self.receiver = ZeroMQReceiver()
+            self.receiver = ZeroMQReceiver(verbose=False)  # Production: no verbose logging
             await self.receiver.start()
 
             # Initialize InfluxDB writer
@@ -181,15 +185,14 @@ class DataServerCoordinator:
         health_task = asyncio.create_task(self._health_monitor_loop())
         self.running_tasks.append(health_task)
 
+        # Start status reporting loop
+        status_task = asyncio.create_task(self._status_reporting_loop())
+        self.running_tasks.append(status_task)
+
         self.logger.info("Background tasks started")
 
     async def _handle_market_data(self, message: MarketDataMessage):
-        """
-        Handle incoming market data message from Virginia.
-
-        Args:
-            message: MarketDataMessage containing market snapshots
-        """
+        """Handle incoming market data message from Virginia"""
         processing_start = time.time()
 
         try:
@@ -201,17 +204,38 @@ class DataServerCoordinator:
 
             # Convert snapshot dictionaries to MarketSnapshot objects
             snapshots = []
+            kalshi_count = 0
+            polymarket_count = 0
+
             for snapshot_data in message.snapshots:
                 try:
-                    # Create MarketSnapshot from the data
+                    # Track source types
+                    source = snapshot_data.get('source', '').lower()
+                    if source == 'kalshi':
+                        kalshi_count += 1
+                        self.stats['kalshi_snapshots_processed'] += 1
+                    elif source == 'polymarket':
+                        polymarket_count += 1
+
+                    # Create MarketSnapshot from the data using unified conversion
                     snapshot = self._convert_snapshot_data(snapshot_data)
                     if snapshot:
                         # Add Virginia timing information
                         snapshot.virginia_sent_to_data_server_ns = int(message.virginia_sent_timestamp * 1_000_000_000)
                         snapshots.append(snapshot)
+                    else:
+                        if source == 'kalshi':
+                            self.stats['kalshi_conversion_errors'] += 1
+
                 except Exception as e:
-                    self.logger.error(f"Error converting snapshot data: {e}")
+                    self.logger.warning(f"Error converting snapshot from {snapshot_data.get('source', 'unknown')}: {e}")
+                    if snapshot_data.get('source', '').lower() == 'kalshi':
+                        self.stats['kalshi_conversion_errors'] += 1
                     continue
+
+            # Log summary for significant batches
+            if len(snapshots) > 0:
+                self.logger.debug(f"Processing batch: {kalshi_count} Kalshi, {polymarket_count} Polymarket snapshots")
 
             if snapshots:
                 # Write to InfluxDB
@@ -222,8 +246,12 @@ class DataServerCoordinator:
 
                 if success:
                     self.stats['snapshots_written_influx'] += len(snapshots)
+                    kalshi_written = len([s for s in snapshots if s.source.lower() == 'kalshi'])
+                    self.stats['kalshi_snapshots_written'] += kalshi_written
                     self.logger.debug(f"Successfully wrote {len(snapshots)} snapshots to InfluxDB")
                 else:
+                    kalshi_failed = len([s for s in snapshots if s.source.lower() == 'kalshi'])
+                    self.stats['kalshi_influx_write_errors'] += kalshi_failed
                     self.logger.error(f"Failed to write {len(snapshots)} snapshots to InfluxDB")
 
             # Track processing latency
@@ -235,12 +263,7 @@ class DataServerCoordinator:
             self.logger.error(f"Error handling market data: {e}")
 
     async def _handle_analysis_update(self, message: AnalysisMessage):
-        """
-        Handle incoming analysis update message from Virginia.
-
-        Args:
-            message: AnalysisMessage containing usage flag updates
-        """
+        """Handle incoming analysis update message from Virginia"""
         processing_start = time.time()
 
         try:
@@ -272,12 +295,7 @@ class DataServerCoordinator:
             self.logger.error(f"Error handling analysis update: {e}")
 
     async def _handle_trade_data(self, message: TradeMessage):
-        """
-        Handle incoming trade data message from Virginia.
-
-        Args:
-            message: TradeMessage containing trade tickets, analysis records, etc.
-        """
+        """Handle incoming trade data message from Virginia"""
         processing_start = time.time()
 
         try:
@@ -299,7 +317,7 @@ class DataServerCoordinator:
                         success = await self.postgres_writer.write_trade_ticket(trade_ticket)
                         if success:
                             records_written += 1
-                            self.logger.debug(f"Wrote trade ticket: {trade_ticket.trade_id}")
+                            self.logger.info(f"Trade executed: {trade_ticket.trade_id}")
                         else:
                             self.logger.error(f"Failed to write trade ticket: {trade_ticket.trade_id}")
                 except Exception as e:
@@ -313,7 +331,6 @@ class DataServerCoordinator:
                         success = await self.postgres_writer.write_analysis_record(analysis_record)
                         if success:
                             records_written += 1
-                            self.logger.debug(f"Wrote analysis record: {analysis_record.analysis_id}")
                         else:
                             self.logger.error(f"Failed to write analysis record: {analysis_record.analysis_id}")
                 except Exception as e:
@@ -327,7 +344,6 @@ class DataServerCoordinator:
                         success = await self.postgres_writer.write_arbitrage_pair(arbitrage_pair)
                         if success:
                             records_written += 1
-                            self.logger.debug(f"Wrote arbitrage pair: {arbitrage_pair.pair_id}")
                         else:
                             self.logger.error(f"Failed to write arbitrage pair: {arbitrage_pair.pair_id}")
                 except Exception as e:
@@ -345,72 +361,29 @@ class DataServerCoordinator:
 
     def _convert_snapshot_data(self, snapshot_data: Dict[str, Any]) -> Optional[MarketSnapshot]:
         """
-        Convert snapshot dictionary to MarketSnapshot object.
+        Convert snapshot dictionary to MarketSnapshot object using unified schema.
 
         Args:
-            snapshot_data: Dictionary containing snapshot data
+            snapshot_data: Dictionary containing snapshot data from Virginia
 
         Returns:
             MarketSnapshot object or None if conversion fails
         """
         try:
-            source = snapshot_data.get('source', '').lower()
+            # Use the unified conversion function designed for Virginia's optimized format
+            # This handles both Kalshi and Polymarket sources automatically
+            snapshot = create_snapshot_from_virginia_data(snapshot_data)
 
-            if source == 'kalshi':
-                # Convert Kalshi snapshot
-                snapshot = create_kalshi_snapshot(
-                    ticker=snapshot_data.get('ticker', ''),
-                    orderbook_dict=snapshot_data.get('orderbook', {}),
-                    api_timestamps={
-                        'api_call_start_ns': snapshot_data.get('api_call_start_ns'),
-                        'api_response_ns': snapshot_data.get('api_response_ns'),
-                        'processing_complete_ns': snapshot_data.get('processing_complete_ns')
-                    },
-                    pair_id=snapshot_data.get('pair_id')
-                )
-
-            elif source == 'polymarket':
-                # Convert Polymarket snapshot
-                snapshot = create_polymarket_snapshot(
-                    condition_id=snapshot_data.get('condition_id', ''),
-                    orderbook_dict=snapshot_data.get('orderbook', {}),
-                    ireland_timestamps={
-                        'ireland_api_call_ns': snapshot_data.get('ireland_api_call_ns'),
-                        'ireland_api_response_ns': snapshot_data.get('ireland_api_response_ns'),
-                        'ireland_processing_complete_ns': snapshot_data.get('ireland_processing_complete_ns'),
-                        'ireland_zeromq_sent_ns': snapshot_data.get('ireland_zeromq_sent_ns')
-                    },
-                    pair_id=snapshot_data.get('pair_id')
-                )
-
-            else:
-                self.logger.error(f"Unknown snapshot source: {source}")
-                return None
-
-            # Add any additional fields from the snapshot data
-            if 'snapshot_id' in snapshot_data:
-                snapshot.snapshot_id = snapshot_data['snapshot_id']
-
-            # Add Virginia timestamps
-            snapshot.virginia_received_ns = snapshot_data.get('virginia_received_ns')
-            snapshot.virginia_enriched_ns = snapshot_data.get('virginia_enriched_ns')
-
+            self.logger.debug(f"Successfully converted {snapshot.source} snapshot for {snapshot.ticker}")
             return snapshot
 
         except Exception as e:
             self.logger.error(f"Error converting snapshot data: {e}")
+            self.logger.debug(f"Snapshot data that failed conversion: {snapshot_data}")
             return None
 
     def _convert_trade_ticket_data(self, trade_data: Dict[str, Any]) -> Optional[TradeTicket]:
-        """
-        Convert trade dictionary to TradeTicket object.
-
-        Args:
-            trade_data: Dictionary containing trade ticket data
-
-        Returns:
-            TradeTicket object or None if conversion fails
-        """
+        """Convert trade dictionary to TradeTicket object"""
         try:
             from models.postgres import TradeVenue, TradeSide, ArbitrageType, TradeStatus
 
@@ -456,15 +429,7 @@ class DataServerCoordinator:
             return None
 
     def _convert_analysis_record_data(self, analysis_data: Dict[str, Any]) -> Optional[AnalysisRecord]:
-        """
-        Convert analysis dictionary to AnalysisRecord object.
-
-        Args:
-            analysis_data: Dictionary containing analysis record data
-
-        Returns:
-            AnalysisRecord object or None if conversion fails
-        """
+        """Convert analysis dictionary to AnalysisRecord object"""
         try:
             from models.postgres import ArbitrageType
 
@@ -495,15 +460,7 @@ class DataServerCoordinator:
             return None
 
     def _convert_arbitrage_pair_data(self, pair_data: Dict[str, Any]) -> Optional[ArbitragePair]:
-        """
-        Convert arbitrage pair dictionary to ArbitragePair object.
-
-        Args:
-            pair_data: Dictionary containing arbitrage pair data
-
-        Returns:
-            ArbitragePair object or None if conversion fails
-        """
+        """Convert arbitrage pair dictionary to ArbitragePair object"""
         try:
             # Create arbitrage pair
             arbitrage_pair = ArbitragePair(
@@ -536,7 +493,7 @@ class DataServerCoordinator:
 
     async def _health_monitor_loop(self):
         """Background health monitoring loop"""
-        self.logger.info("Starting health monitor loop...")
+        self.logger.info("Health monitor started")
 
         while not self.shutdown_requested:
             try:
@@ -554,7 +511,43 @@ class DataServerCoordinator:
                 self.logger.error(f"Error in health monitor loop: {e}")
                 await asyncio.sleep(30)
 
-        self.logger.info("Health monitor loop stopped")
+        self.logger.info("Health monitor stopped")
+
+    async def _status_reporting_loop(self):
+        """Background status reporting loop"""
+        self.logger.info("Status reporting started")
+
+        while not self.shutdown_requested:
+            try:
+                await asyncio.sleep(300)  # Report every 5 minutes
+
+                if not self.shutdown_requested:
+                    current_time = time.time()
+                    uptime_hours = (current_time - self.start_time) / 3600
+
+                    # Calculate rates
+                    message_rate = self.stats['messages_processed'] / max(uptime_hours * 3600, 1)
+
+                    # Calculate Kalshi success rate
+                    kalshi_success_rate = 0
+                    if self.stats['kalshi_snapshots_processed'] > 0:
+                        kalshi_success_rate = (self.stats['kalshi_snapshots_written'] /
+                                               self.stats['kalshi_snapshots_processed']) * 100
+
+                    self.logger.info(f"STATUS: {uptime_hours:.1f}h uptime | "
+                                     f"{self.stats['messages_processed']} msgs ({message_rate:.1f}/min) | "
+                                     f"Kalshi: {self.stats['kalshi_snapshots_written']}/{self.stats['kalshi_snapshots_processed']} ({kalshi_success_rate:.1f}%) | "
+                                     f"InfluxDB: {self.stats['snapshots_written_influx']} | "
+                                     f"PostgreSQL: {self.stats['records_written_postgres']} | "
+                                     f"Errors: {self.stats['processing_errors']}")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Error in status reporting loop: {e}")
+                await asyncio.sleep(60)
+
+        self.logger.info("Status reporting stopped")
 
     async def _perform_health_check(self):
         """Perform comprehensive health check"""
@@ -567,17 +560,37 @@ class DataServerCoordinator:
             postgres_healthy = self.postgres_writer.get_health_summary()[
                 'is_healthy'] if self.postgres_writer else False
 
-            # Log health status every 5 minutes
-            if int(current_time) % 300 == 0:
-                self.logger.info(f"System Health - Receiver: {receiver_healthy}, "
-                                 f"InfluxDB: {influx_healthy}, PostgreSQL: {postgres_healthy}, "
-                                 f"Messages: {self.stats['messages_processed']}, "
-                                 f"Uptime: {(current_time - self.start_time) / 3600:.1f}h")
+            # Check for data staleness (no messages in 5 minutes)
+            data_stale = (current_time - self.stats.get('last_message_time', current_time)) > 300
+
+            if not receiver_healthy or not influx_healthy or not postgres_healthy or data_stale:
+                self.logger.warning(f"Health issues detected - Receiver: {receiver_healthy}, "
+                                    f"InfluxDB: {influx_healthy}, PostgreSQL: {postgres_healthy}, "
+                                    f"Data stale: {data_stale}")
 
             self.last_health_check = current_time
 
         except Exception as e:
             self.logger.error(f"Health check failed: {e}")
+
+    async def run_forever(self):
+        """Run the coordinator continuously until stopped"""
+        try:
+            await self.start()
+
+            self.logger.info("ARBITRAGE DATA SERVER RUNNING")
+            self.logger.info(f"Listening on ports: {CONFIG.zeromq.market_data_port}, "
+                             f"{CONFIG.zeromq.analysis_data_port}, {CONFIG.zeromq.trade_data_port}")
+
+            # Run until shutdown requested
+            while not self.shutdown_requested:
+                await asyncio.sleep(1)
+
+        except Exception as e:
+            self.logger.error(f"Coordinator error: {e}")
+            raise
+        finally:
+            await self.stop()
 
     def get_status(self) -> Dict[str, Any]:
         """Get comprehensive coordinator status"""
@@ -647,76 +660,22 @@ def setup_signal_handlers(coordinator: DataServerCoordinator):
 
 
 # Demo and testing
-async def test_data_server_coordinator():
-    """Test Data Server coordinator functionality"""
-    print("TESTING DATA SERVER COORDINATOR")
-    print("=" * 50)
+if __name__ == "__main__":
+    import asyncio
 
-    try:
-        # Initialize coordinator
+
+    async def test_coordinator():
+        """Test coordinator functionality"""
+        print("TESTING DATA SERVER COORDINATOR")
+        print("=" * 50)
+
         coordinator = DataServerCoordinator()
-
-        # Setup signal handlers
         setup_signal_handlers(coordinator)
 
-        # Start coordinator
-        await coordinator.start()
-        print("✅ Data Server coordinator started")
-
-        print("📡 Data Server is now ready to receive data from Virginia")
-        print("   Running for 30 seconds to test message processing...")
-
-        # Run for 30 seconds
-        start_time = time.time()
-        while time.time() - start_time < 30 and not coordinator.shutdown_requested:
-            await asyncio.sleep(1)
-
-            # Show periodic status
-            if int(time.time() - start_time) % 10 == 0:
-                status = coordinator.get_status()
-                print(f"📊 Status: {status['coordinator_stats']['messages_processed']} messages processed")
-
-        # Show final status
-        status = coordinator.get_status()
-        print(f"\n📊 Final Status:")
-        print(f"  Messages Processed: {status['coordinator_stats']['messages_processed']}")
-        print(f"  Market Data: {status['coordinator_stats']['market_data_processed']}")
-        print(f"  Analysis Updates: {status['coordinator_stats']['analysis_updates_processed']}")
-        print(f"  Trade Data: {status['coordinator_stats']['trade_data_processed']}")
-        print(f"  InfluxDB Snapshots: {status['coordinator_stats']['snapshots_written_influx']}")
-        print(f"  PostgreSQL Records: {status['coordinator_stats']['records_written_postgres']}")
-        print(f"  Processing Rate: {status['performance']['message_rate_per_second']:.2f}/sec")
-        print(f"  Avg Latency: {status['performance']['avg_processing_latency_ms']:.2f}ms")
-
-        # Show health
-        health = coordinator.get_health_summary()
-        print(f"\n🏥 Health Summary:")
-        print(f"  Overall Healthy: {health['is_healthy']}")
-        print(f"  Components: {health['components_healthy']}/{health['component_count']} healthy")
-        print(f"  Error Rate: {health['error_rate_percent']:.2f}%")
-        print(f"  Uptime: {health['uptime_hours']:.1f} hours")
-
-        # Stop coordinator
-        await coordinator.stop()
-        print("✅ Data Server coordinator stopped")
-
-        print("\n✅ Data Server coordinator test completed!")
-        return True
-
-    except Exception as e:
-        print(f"❌ Data Server coordinator test failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+        try:
+            await coordinator.run_forever()
+        except KeyboardInterrupt:
+            print("\nTest interrupted by user")
 
 
-if __name__ == "__main__":
-    try:
-        success = asyncio.run(test_data_server_coordinator())
-        if not success:
-            exit(1)
-    except KeyboardInterrupt:
-        print("\nTest interrupted by user")
-    except Exception as e:
-        print(f"Test execution failed: {e}")
-        exit(1)
+    asyncio.run(test_coordinator())

@@ -4,6 +4,8 @@ coordinator.py
 
 Enhanced central async coordinator for the arbitrage trading system.
 Manages data flows, API calls, and system orchestration with DATA BIFURCATION.
+Uses IntervalLogger for high-frequency data to reduce log noise.
+Includes Data Flow Monitor for visibility into message flow and structure.
 
 Bifurcates incoming data to both:
 - Trading lane: opportunity scanner for arbitrage detection
@@ -23,7 +25,7 @@ project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
 # Import after path setup
-from utils.logger import get_coordinator_logger
+from utils.logger import get_coordinator_logger, get_coordinator_interval_logger
 from utils.config import CONFIG
 from database.read_from import DatabaseReader, ArbPair
 from api.data_feed import KalshiDataFeed, KalshiMarketData
@@ -70,11 +72,16 @@ class CoordinatorMetrics:
 
 class ArbitrageCoordinator:
     """
-    Enhanced central coordinator with DATA BIFURCATION.
+    Enhanced central coordinator with DATA BIFURCATION, INTERVAL LOGGING, and DATA FLOW MONITORING.
 
     This coordinator now splits incoming data into two lanes:
     1. Trading Lane: Real-time arbitrage detection and execution
     2. Storage Lane: Historical data storage for analysis and compliance
+
+    NEW: Uses IntervalLogger to reduce noise from high-frequency data while
+    still providing detailed samples and summaries.
+
+    NEW: Data Flow Monitor shows real-time status and message samples every 30 seconds.
 
     Manages:
     - Ticker refresh from database
@@ -83,11 +90,16 @@ class ArbitrageCoordinator:
     - Data distribution to opportunity scanner AND database server
     - Health monitoring and error recovery
     - Comprehensive timestamp tracking
+    - Data flow visibility and monitoring
     """
 
     def __init__(self):
-        """Initialize the enhanced arbitrage coordinator"""
+        """Initialize the enhanced arbitrage coordinator with interval logging and data flow monitoring"""
+        # Regular logger for system events
         self.logger = get_coordinator_logger()
+
+        # NEW: Interval logger for high-frequency data
+        self.interval_logger = get_coordinator_interval_logger()
 
         # Core components
         self.database_reader: Optional[DatabaseReader] = None
@@ -101,6 +113,10 @@ class ArbitrageCoordinator:
         self.active_pairs: Dict[int, ArbPair] = {}
         self.kalshi_tickers: Set[str] = set()
         self.polymarket_condition_ids: Set[str] = set()
+
+        # NEW: Data flow monitoring - store last samples
+        self._last_kalshi_sample: Optional[Dict[str, Any]] = None
+        self._last_polymarket_sample: Optional[Dict[str, Any]] = None
 
         # Timing and control
         self.start_time = time.time()
@@ -143,7 +159,9 @@ class ArbitrageCoordinator:
         # Task references for cleanup
         self.running_tasks: List[asyncio.Task] = []
 
-        self.logger.info("Enhanced arbitrage coordinator initialized with data bifurcation")
+        self.logger.info(
+            "Enhanced arbitrage coordinator initialized with data bifurcation, interval logging, and data flow monitoring")
+        self.logger.info(f"Sample interval: {getattr(CONFIG, 'log_sample_interval', 100)} messages")
 
     async def __aenter__(self):
         """Async context manager entry"""
@@ -233,23 +251,46 @@ class ArbitrageCoordinator:
 
     async def _handle_kalshi_data(self, market_data: Dict[str, dict]):
         """
-        Enhanced Kalshi data handler with BIFURCATION.
+        Enhanced Kalshi data handler with BIFURCATION, INTERVAL LOGGING, and SAMPLE STORAGE.
 
         Splits data to both:
         1. Trading lane: opportunity scanner
         2. Storage lane: database server
 
+        Uses IntervalLogger to reduce noise while providing detailed samples.
+        Stores samples for data flow monitoring.
+
         Args:
             market_data: Dictionary of ticker -> raw orderbook dict
         """
         if not market_data:
-            self.logger.warning("Received empty Kalshi market data")
+            self.interval_logger.warning('kalshi_data', "Received empty Kalshi market data")
             return
 
         # Virginia timestamp: when data received
         virginia_received_ns = time.time_ns()
 
-        self.logger.debug(f"Received Kalshi data for {len(market_data)} markets")
+        # NEW: Store sample for data flow monitoring
+        try:
+            first_ticker = list(market_data.keys())[0]
+            first_raw_data = market_data[first_ticker]
+            # Create sample snapshot
+            sample_snapshot = self._create_kalshi_snapshot(first_ticker, first_raw_data, virginia_received_ns)
+            self._last_kalshi_sample = sample_snapshot
+        except Exception as e:
+            self.logger.error(f"Error storing Kalshi sample: {e}")
+
+        # Use interval logger for high-frequency data
+        self.interval_logger.debug(
+            'kalshi_data',
+            f"Received Kalshi data for {len(market_data)} markets",
+            {
+                'market_count': len(market_data),
+                'tickers': list(market_data.keys()),
+                'sample_data': {k: v for k, v in list(market_data.items())[:2]},  # Show first 2 markets
+                'virginia_received_ns': virginia_received_ns
+            }
+        )
 
         try:
             # Convert raw orderbook data to enhanced format with Virginia timestamps
@@ -262,6 +303,7 @@ class ArbitrageCoordinator:
                     enhanced_snapshots.append(snapshot)
 
                 except Exception as e:
+                    # Use regular logger for errors (always shows)
                     self.logger.error(f"Error processing Kalshi {ticker} data: {e}")
                     continue
 
@@ -282,7 +324,16 @@ class ArbitrageCoordinator:
                 self.metrics.kalshi_snapshots_bifurcated += len(enhanced_snapshots)
                 self.health_status.last_kalshi_data = time.time()
 
-                self.logger.debug(f"Successfully bifurcated {len(enhanced_snapshots)} Kalshi snapshots")
+                # Use interval logger for success summary
+                self.interval_logger.debug(
+                    'kalshi_bifurcation',
+                    f"Successfully bifurcated {len(enhanced_snapshots)} Kalshi snapshots",
+                    {
+                        'snapshots_count': len(enhanced_snapshots),
+                        'processing_time_ns': virginia_enriched_ns - virginia_received_ns,
+                        'total_bifurcated': self.metrics.kalshi_snapshots_bifurcated
+                    }
+                )
             else:
                 self.logger.warning("No valid Kalshi snapshots to bifurcate")
 
@@ -291,11 +342,14 @@ class ArbitrageCoordinator:
 
     async def _handle_polymarket_data(self, market_data: Dict[str, PolymarketData]):
         """
-        Enhanced Polymarket data handler with BIFURCATION.
+        Enhanced Polymarket data handler with BIFURCATION, INTERVAL LOGGING, and SAMPLE STORAGE.
 
         Splits data to both:
         1. Trading lane: opportunity scanner
         2. Storage lane: database server
+
+        Uses IntervalLogger to reduce noise while providing detailed samples.
+        Stores samples for data flow monitoring.
 
         Args:
             market_data: Dictionary of condition_id -> PolymarketData
@@ -306,7 +360,28 @@ class ArbitrageCoordinator:
         # Virginia timestamp: when data received from Ireland
         virginia_received_ns = time.time_ns()
 
-        self.logger.debug(f"Received Polymarket data for {len(market_data)} condition IDs")
+        # NEW: Store sample for data flow monitoring
+        try:
+            first_condition_id = list(market_data.keys())[0]
+            first_polymarket_data = market_data[first_condition_id]
+            # Create sample snapshot
+            sample_snapshot = self._create_polymarket_snapshot(first_condition_id, first_polymarket_data,
+                                                               virginia_received_ns)
+            self._last_polymarket_sample = sample_snapshot
+        except Exception as e:
+            self.logger.error(f"Error storing Polymarket sample: {e}")
+
+        # Use interval logger for high-frequency data
+        self.interval_logger.debug(
+            'polymarket_data',
+            f"Received Polymarket data for {len(market_data)} condition IDs",
+            {
+                'condition_count': len(market_data),
+                'condition_ids': [cid[:10] + "..." for cid in list(market_data.keys())[:3]],  # Show first 3
+                'sample_data': {k[:10] + "...": v.__dict__ for k, v in list(market_data.items())[:2]},  # Show first 2
+                'virginia_received_ns': virginia_received_ns
+            }
+        )
 
         try:
             # Convert PolymarketData to enhanced snapshots with Virginia timestamps
@@ -319,6 +394,7 @@ class ArbitrageCoordinator:
                     enhanced_snapshots.append(snapshot)
 
                 except Exception as e:
+                    # Use regular logger for errors (always shows)
                     self.logger.error(f"Error processing Polymarket {condition_id[:10]}... data: {e}")
                     continue
 
@@ -338,7 +414,16 @@ class ArbitrageCoordinator:
                 self.metrics.polymarket_snapshots_bifurcated += len(enhanced_snapshots)
                 self.health_status.last_polymarket_data = time.time()
 
-                self.logger.debug(f"Successfully bifurcated {len(enhanced_snapshots)} Polymarket snapshots")
+                # Use interval logger for success summary
+                self.interval_logger.debug(
+                    'polymarket_bifurcation',
+                    f"Successfully bifurcated {len(enhanced_snapshots)} Polymarket snapshots",
+                    {
+                        'snapshots_count': len(enhanced_snapshots),
+                        'processing_time_ns': virginia_enriched_ns - virginia_received_ns,
+                        'total_bifurcated': self.metrics.polymarket_snapshots_bifurcated
+                    }
+                )
             else:
                 self.logger.warning("No valid Polymarket snapshots to bifurcate")
 
@@ -347,7 +432,11 @@ class ArbitrageCoordinator:
 
     def _create_kalshi_snapshot(self, ticker: str, raw_data: dict, virginia_received_ns: int) -> Dict[str, Any]:
         """
-        Create enhanced Kalshi snapshot with comprehensive timestamps.
+        Create enhanced Kalshi snapshot with OPTIMIZED SCHEMA.
+
+        Schema:
+        - Tags: source=kalshi, ticker=KXPRESIRELAND-25-MM
+        - Fields: full_orderbook + timing chain ONLY
 
         Args:
             ticker: Kalshi ticker
@@ -355,41 +444,43 @@ class ArbitrageCoordinator:
             virginia_received_ns: Virginia receive timestamp
 
         Returns:
-            Enhanced snapshot dictionary
+            Enhanced snapshot dictionary with optimized schema
         """
-        # Extract orderbook data
-        yes_levels = raw_data.get('yes', [])
-        no_levels = raw_data.get('no', [])
+        import json
 
-        # Calculate best prices (convert cents to dollars)
-        yes_best_bid = max(level[0] for level in yes_levels) / 100 if yes_levels else None
-        yes_best_ask = min(level[0] for level in yes_levels) / 100 if yes_levels else None
-        no_best_bid = max(level[0] for level in no_levels) / 100 if no_levels else None
-        no_best_ask = min(level[0] for level in no_levels) / 100 if no_levels else None
+        # Extract timing from raw data
+        api_call_start_ns = raw_data.get('api_call_start_ns')
+        api_response_ns = raw_data.get('api_response_ns')
+        processing_complete_ns = time.time_ns()
+
+        # Format orderbook as JSON string
+        # Kalshi format: {"yes": [[price_cents, quantity], ...], "no": [[price_cents, quantity], ...]}
+        full_orderbook = json.dumps(raw_data, separators=(',', ':'))
 
         return {
-            'snapshot_id': f"kalshi-{int(time.time() * 1000000)}",  # Microsecond precision
+            # Schema identifiers (become tags in InfluxDB)
             'source': 'kalshi',
             'ticker': ticker,
-            'yes_bid': yes_best_bid,
-            'yes_ask': yes_best_ask,
-            'no_bid': no_best_bid,
-            'no_ask': no_best_ask,
-            'yes_bid_size': yes_levels[0][1] if yes_levels else None,
-            'yes_ask_size': yes_levels[0][1] if yes_levels else None,
-            'no_bid_size': no_levels[0][1] if no_levels else None,
-            'no_ask_size': no_levels[0][1] if no_levels else None,
-            'yes_levels_count': len(yes_levels),
-            'no_levels_count': len(no_levels),
-            'full_orderbook': raw_data,  # Store complete raw data
+
+            # Raw data (field)
+            'full_orderbook': full_orderbook,
+
+            # Timing chain (fields)
+            'api_call_start_ns': api_call_start_ns,
+            'api_response_ns': api_response_ns,
+            'processing_complete_ns': processing_complete_ns,
             'virginia_received_ns': virginia_received_ns,
-            'processing_timestamp': time.time()
+            'data_server_stored_ns': None  # Set later by data server
         }
 
     def _create_polymarket_snapshot(self, condition_id: str, polymarket_data: PolymarketData,
                                     virginia_received_ns: int) -> Dict[str, Any]:
         """
-        Create enhanced Polymarket snapshot with comprehensive timestamps.
+        Create enhanced Polymarket snapshot with OPTIMIZED SCHEMA.
+
+        Schema:
+        - Tags: source=polymarket, ticker=0x26d06d9c...
+        - Fields: full_orderbook + timing chain ONLY
 
         Args:
             condition_id: Polymarket condition ID
@@ -397,29 +488,52 @@ class ArbitrageCoordinator:
             virginia_received_ns: Virginia receive timestamp
 
         Returns:
-            Enhanced snapshot dictionary
+            Enhanced snapshot dictionary with optimized schema
         """
-        return {
-            'snapshot_id': f"polymarket-{int(time.time() * 1000000)}",  # Microsecond precision
-            'source': 'polymarket',
+        import json
+
+        processing_complete_ns = time.time_ns()
+
+        # Format Polymarket data as JSON string
+        # Include all raw data from Ireland in structured format
+        polymarket_raw = {
             'condition_id': condition_id,
-            'ticker': condition_id,  # Use condition_id as ticker for consistency
-            'yes_bid': polymarket_data.yes_price,
-            'yes_ask': polymarket_data.yes_price,  # Polymarket provides single price
-            'no_bid': polymarket_data.no_price,
-            'no_ask': polymarket_data.no_price,
-            'yes_bid_size': None,  # Would need orderbook data
-            'yes_ask_size': None,
-            'no_bid_size': None,
-            'no_ask_size': None,
+            'yes_price': polymarket_data.yes_price,
+            'no_price': polymarket_data.no_price,
             'volume': polymarket_data.volume,
-            'liquidity': polymarket_data.liquidity,
-            'full_orderbook': {'condition_id': condition_id, 'data': polymarket_data.__dict__},
-            'virginia_received_ns': virginia_received_ns,
-            # Preserve Ireland timestamps if available
+            'liquidity': polymarket_data.liquidity
+        }
+
+        # Add any additional fields from PolymarketData
+        for attr in dir(polymarket_data):
+            if not attr.startswith('_') and attr not in ['yes_price', 'no_price', 'volume', 'liquidity']:
+                try:
+                    value = getattr(polymarket_data, attr)
+                    if not callable(value):
+                        polymarket_raw[attr] = value
+                except:
+                    pass
+
+        full_orderbook = json.dumps(polymarket_raw, separators=(',', ':'))
+
+        return {
+            # Schema identifiers (become tags in InfluxDB)
+            'source': 'polymarket',
+            'ticker': condition_id,  # Use condition_id as ticker
+
+            # Raw data (field)
+            'full_orderbook': full_orderbook,
+
+            # Ireland timing chain (fields)
+            'ireland_api_call_ns': getattr(polymarket_data, 'ireland_api_call_ns', None),
+            'ireland_api_response_ns': getattr(polymarket_data, 'ireland_api_response_ns', None),
             'ireland_processing_complete_ns': getattr(polymarket_data, 'ireland_processing_complete_ns', None),
             'ireland_zeromq_sent_ns': getattr(polymarket_data, 'ireland_zeromq_sent_ns', None),
-            'processing_timestamp': time.time()
+
+            # Virginia timing chain (fields)
+            'virginia_received_ns': virginia_received_ns,
+            'processing_complete_ns': processing_complete_ns,
+            'data_server_stored_ns': None  # Set later by data server
         }
 
     async def _bifurcate_kalshi_data(self, original_data: Dict[str, dict], enhanced_snapshots: List[Dict[str, Any]]):
@@ -434,16 +548,27 @@ class ArbitrageCoordinator:
             # TRADING LANE: Send to opportunity scanner (existing format)
             if self.opportunity_scanner:
                 await self.opportunity_scanner.receive_kalshi_data(original_data)
-                self.logger.debug(f"Sent {len(original_data)} Kalshi markets to trading lane")
+                # Use interval logger for trading lane activity
+                self.interval_logger.debug(
+                    'trading_lane',
+                    f"Sent {len(original_data)} Kalshi markets to trading lane",
+                    {'markets_sent': len(original_data), 'lane': 'trading'}
+                )
 
             # STORAGE LANE: Send to database server (enhanced format)
             if self.database_publisher:
                 success = await self.database_publisher.send_market_data("kalshi", enhanced_snapshots)
                 if success:
                     self.metrics.database_sends_successful += 1
-                    self.logger.debug(f"Sent {len(enhanced_snapshots)} Kalshi snapshots to storage lane")
+                    # Use interval logger for storage lane activity
+                    self.interval_logger.debug(
+                        'storage_lane',
+                        f"Sent {len(enhanced_snapshots)} Kalshi snapshots to storage lane",
+                        {'snapshots_sent': len(enhanced_snapshots), 'lane': 'storage', 'success': True}
+                    )
                 else:
                     self.metrics.database_sends_failed += 1
+                    # Errors always show
                     self.logger.error(f"Failed to send {len(enhanced_snapshots)} Kalshi snapshots to storage lane")
 
         except Exception as e:
@@ -463,21 +588,162 @@ class ArbitrageCoordinator:
             # TRADING LANE: Send to opportunity scanner (existing format)
             if self.opportunity_scanner:
                 await self.opportunity_scanner.receive_polymarket_data(original_data)
-                self.logger.debug(f"Sent {len(original_data)} Polymarket markets to trading lane")
+                # Use interval logger for trading lane activity
+                self.interval_logger.debug(
+                    'trading_lane',
+                    f"Sent {len(original_data)} Polymarket markets to trading lane",
+                    {'markets_sent': len(original_data), 'lane': 'trading'}
+                )
 
             # STORAGE LANE: Send to database server (enhanced format)
             if self.database_publisher:
                 success = await self.database_publisher.send_market_data("polymarket", enhanced_snapshots)
                 if success:
                     self.metrics.database_sends_successful += 1
-                    self.logger.debug(f"Sent {len(enhanced_snapshots)} Polymarket snapshots to storage lane")
+                    # Use interval logger for storage lane activity
+                    self.interval_logger.debug(
+                        'storage_lane',
+                        f"Sent {len(enhanced_snapshots)} Polymarket snapshots to storage lane",
+                        {'snapshots_sent': len(enhanced_snapshots), 'lane': 'storage', 'success': True}
+                    )
                 else:
                     self.metrics.database_sends_failed += 1
+                    # Errors always show
                     self.logger.error(f"Failed to send {len(enhanced_snapshots)} Polymarket snapshots to storage lane")
 
         except Exception as e:
             self.logger.error(f"Error in Polymarket data bifurcation: {e}")
             self.metrics.database_sends_failed += 1
+
+    async def _data_flow_monitor_loop(self):
+        """
+        NEW: Monitor data flow and show samples.
+        Shows status every 30 seconds with actual message samples.
+        """
+        self.logger.info("Starting data flow monitor - will show samples every 30 seconds")
+
+        last_kalshi_count = 0
+        last_polymarket_count = 0
+        last_check_time = time.time()
+
+        while not self.shutdown_requested:
+            try:
+                await asyncio.sleep(30)  # Check every 30 seconds
+
+                current_time = time.time()
+                elapsed = current_time - last_check_time
+
+                # Get current counts
+                current_kalshi = self.metrics.kalshi_snapshots_bifurcated
+                current_polymarket = self.metrics.polymarket_snapshots_bifurcated
+
+                # Calculate flow rates
+                kalshi_rate = (current_kalshi - last_kalshi_count) / elapsed if elapsed > 0 else 0
+                polymarket_rate = (current_polymarket - last_polymarket_count) / elapsed if elapsed > 0 else 0
+
+                # Data flow status
+                kalshi_flowing = kalshi_rate > 0
+                polymarket_flowing = polymarket_rate > 0
+
+                self.logger.info("=" * 60)
+                self.logger.info("DATA FLOW STATUS REPORT")
+                self.logger.info("=" * 60)
+                self.logger.info(f"Kalshi Data Flowing: {kalshi_flowing} ({kalshi_rate:.2f} snapshots/sec)")
+                self.logger.info(f"Polymarket Data Flowing: {polymarket_flowing} ({polymarket_rate:.2f} snapshots/sec)")
+                self.logger.info(f"Total Kalshi Snapshots: {current_kalshi}")
+                self.logger.info(f"Total Polymarket Snapshots: {current_polymarket}")
+                self.logger.info(f"Active Pairs: {len(self.active_pairs)}")
+                self.logger.info(f"Kalshi Tickers: {list(self.kalshi_tickers)}")
+                self.logger.info(
+                    f"Polymarket IDs: {[cid[:10] + '...' for cid in list(self.polymarket_condition_ids)[:3]]}")
+
+                # Store samples for display
+                if hasattr(self, '_last_kalshi_sample') and self._last_kalshi_sample:
+                    self.logger.info("\nLAST KALSHI SAMPLE:")
+                    self._log_message_sample("KALSHI", self._last_kalshi_sample)
+                else:
+                    self.logger.info("\nKALSHI: No samples received yet")
+
+                if hasattr(self, '_last_polymarket_sample') and self._last_polymarket_sample:
+                    self.logger.info("\nLAST POLYMARKET SAMPLE:")
+                    self._log_message_sample("POLYMARKET", self._last_polymarket_sample)
+                else:
+                    self.logger.info("\nPOLYMARKET: No samples received yet")
+
+                self.logger.info("=" * 60)
+
+                # Update for next iteration
+                last_kalshi_count = current_kalshi
+                last_polymarket_count = current_polymarket
+                last_check_time = current_time
+
+            except Exception as e:
+                self.logger.error(f"Error in data flow monitor: {e}")
+                await asyncio.sleep(30)
+
+        self.logger.info("Data flow monitor stopped")
+
+    def _log_message_sample(self, source: str, sample_data: dict):
+        """NEW: Log a detailed sample of message data"""
+        try:
+            self.logger.info(f"--- {source} MESSAGE SAMPLE ---")
+
+            if source == "KALSHI":
+                # Show Kalshi specific structure
+                self.logger.info(f"Ticker: {sample_data.get('ticker', 'MISSING')}")
+                self.logger.info(f"Snapshot ID: {sample_data.get('snapshot_id', 'MISSING')}")
+                self.logger.info(f"Yes Bid: {sample_data.get('yes_bid')}")
+                self.logger.info(f"Yes Ask: {sample_data.get('yes_ask')}")
+                self.logger.info(f"No Bid: {sample_data.get('no_bid')}")
+                self.logger.info(f"No Ask: {sample_data.get('no_ask')}")
+                self.logger.info(f"Yes Levels Count: {sample_data.get('yes_levels_count')}")
+                self.logger.info(f"No Levels Count: {sample_data.get('no_levels_count')}")
+
+                # Show orderbook structure
+                full_orderbook = sample_data.get('full_orderbook', {})
+                if isinstance(full_orderbook, dict):
+                    self.logger.info(f"Full Orderbook Keys: {list(full_orderbook.keys())}")
+                    if 'yes' in full_orderbook:
+                        yes_levels = full_orderbook['yes']
+                        self.logger.info(f"Yes Levels (first 3): {yes_levels[:3] if yes_levels else 'None'}")
+                    if 'no' in full_orderbook:
+                        no_levels = full_orderbook['no']
+                        self.logger.info(f"No Levels (first 3): {no_levels[:3] if no_levels else 'None'}")
+
+                # Show timestamps
+                self.logger.info(f"API Call Start: {sample_data.get('api_call_start_ns')}")
+                self.logger.info(f"API Response: {sample_data.get('api_response_ns')}")
+                self.logger.info(f"Virginia Received: {sample_data.get('virginia_received_ns')}")
+                self.logger.info(f"Virginia Enriched: {sample_data.get('virginia_enriched_ns')}")
+
+            elif source == "POLYMARKET":
+                # Show Polymarket specific structure
+                self.logger.info(f"Condition ID: {sample_data.get('condition_id', 'MISSING')[:20]}...")
+                self.logger.info(f"Snapshot ID: {sample_data.get('snapshot_id', 'MISSING')}")
+                self.logger.info(f"Yes Price: {sample_data.get('yes_bid')}")  # Polymarket uses single price
+                self.logger.info(f"No Price: {sample_data.get('no_bid')}")
+                self.logger.info(f"Volume: {sample_data.get('volume')}")
+                self.logger.info(f"Liquidity: {sample_data.get('liquidity')}")
+
+                # Show full data structure
+                full_orderbook = sample_data.get('full_orderbook', {})
+                if isinstance(full_orderbook, dict):
+                    self.logger.info(f"Full Data Keys: {list(full_orderbook.keys())}")
+                    polymarket_data = full_orderbook.get('data', {})
+                    if polymarket_data:
+                        self.logger.info(
+                            f"Polymarket Data Fields: {list(polymarket_data.keys()) if isinstance(polymarket_data, dict) else type(polymarket_data)}")
+
+                # Show timestamps
+                self.logger.info(f"Virginia Received: {sample_data.get('virginia_received_ns')}")
+                self.logger.info(f"Virginia Enriched: {sample_data.get('virginia_enriched_ns')}")
+                self.logger.info(f"Ireland Processing Complete: {sample_data.get('ireland_processing_complete_ns')}")
+                self.logger.info(f"Ireland ZeroMQ Sent: {sample_data.get('ireland_zeromq_sent_ns')}")
+
+            self.logger.info(f"--- END {source} SAMPLE ---")
+
+        except Exception as e:
+            self.logger.error(f"Error logging {source} sample: {e}")
 
     async def _refresh_arbitrage_pairs(self) -> bool:
         """
@@ -575,18 +841,28 @@ class ArbitrageCoordinator:
 
     async def _handle_trade_fills(self, fill: TradeFill):
         """Handle incoming trade fill notifications from Ireland"""
+        # Trade fills are important - always log (not interval)
         self.logger.info(f"Received trade fill: {fill.condition_id[:10]}... "
                          f"{fill.side} {fill.size}@{fill.price}")
         self.metrics.trade_fills_received += 1
 
     async def _handle_system_metrics(self, metrics: SystemMetrics):
         """Handle incoming system metrics from Ireland server"""
-        self.logger.debug(f"Ireland system metrics: {metrics.polymarket_api_status} - "
-                          f"{metrics.api_latency_ms:.1f}ms latency - "
-                          f"{metrics.active_subscriptions} subscriptions")
+        # Use interval logger for system metrics to reduce noise
+        self.interval_logger.debug(
+            'ireland_metrics',
+            f"Ireland system metrics received",
+            {
+                'polymarket_api_status': metrics.polymarket_api_status,
+                'api_latency_ms': metrics.api_latency_ms,
+                'active_subscriptions': metrics.active_subscriptions,
+                'timestamp': time.time()
+            }
+        )
 
     async def _handle_error_alerts(self, alert: ErrorAlert):
         """Handle error alerts from Ireland server"""
+        # Errors always show regardless of interval
         self.logger.error(f"IRELAND ERROR ALERT: {alert.severity} - {alert.error_type}")
         self.logger.error(f"Message: {alert.message}")
         self.logger.error(f"Affected condition IDs: {len(alert.condition_ids_affected)}")
@@ -621,7 +897,7 @@ class ArbitrageCoordinator:
                 scanner_status = self.opportunity_scanner.get_status()
                 self.health_status.scanner_healthy = scanner_status.get('is_running', False)
 
-            # Enhanced health logging every 5 minutes
+            # Enhanced health logging every 5 minutes (use regular logger for system health)
             if int(current_time) % 300 == 0 and int(current_time) != int(self.last_health_check):
                 self.logger.info(f"Enhanced System Health - DB: {self.health_status.database_connected}, "
                                  f"Kalshi: {self.health_status.kalshi_api_healthy}, "
@@ -640,7 +916,8 @@ class ArbitrageCoordinator:
 
     async def start(self):
         """Start the enhanced arbitrage coordination system"""
-        self.logger.info("Starting enhanced arbitrage coordinator with data bifurcation...")
+        self.logger.info(
+            "Starting enhanced arbitrage coordinator with data bifurcation, interval logging, and data flow monitoring...")
 
         try:
             if not await self._initialize_components():
@@ -681,6 +958,10 @@ class ArbitrageCoordinator:
             health_task = asyncio.create_task(self._health_monitor_loop())
             self.running_tasks.append(health_task)
 
+            # NEW: Data flow monitoring loop
+            data_flow_task = asyncio.create_task(self._data_flow_monitor_loop())
+            self.running_tasks.append(data_flow_task)
+
             # Start Kalshi data feed
             if self.kalshi_feed:
                 kalshi_task = asyncio.create_task(self.kalshi_feed.run_data_feed())
@@ -697,6 +978,8 @@ class ArbitrageCoordinator:
             self.logger.info(f"Tracking {len(self.kalshi_tickers)} Kalshi tickers")
             self.logger.info(f"Routing {len(self.polymarket_condition_ids)} Polymarket condition IDs to Ireland")
             self.logger.info("Data bifurcation: Trading lane + Storage lane active")
+            self.logger.info(f"Interval logging: Sample every {getattr(CONFIG, 'log_sample_interval', 100)} messages")
+            self.logger.info("Data flow monitoring: Status reports every 30 seconds")
 
         except Exception as e:
             self.logger.error(f"Failed to start enhanced arbitrage coordinator: {e}")
@@ -828,8 +1111,11 @@ class ArbitrageCoordinator:
 
     def get_status(self) -> Dict[str, Any]:
         """
-        Get enhanced coordinator status including bifurcation metrics.
+        Get enhanced coordinator status including bifurcation metrics and interval logging stats.
         """
+        # Get interval logger stats
+        interval_stats = self.interval_logger.get_stats() if hasattr(self, 'interval_logger') else {}
+
         return {
             'is_running': self.is_running,
             'uptime_hours': self.health_status.uptime_seconds / 3600,
@@ -863,6 +1149,7 @@ class ArbitrageCoordinator:
                                      1)) * 100,
                 'total_snapshots_sent': self.metrics.kalshi_snapshots_bifurcated + self.metrics.polymarket_snapshots_bifurcated
             },
+            'interval_logging': interval_stats,  # NEW: Interval logging statistics
             'last_activities': {
                 'ticker_refresh': self.health_status.last_ticker_refresh,
                 'kalshi_data': self.health_status.last_kalshi_data,
@@ -878,6 +1165,7 @@ class ArbitrageCoordinator:
         if not self.publisher_manager:
             return {"status": "ERROR", "message": "Publisher not available"}
 
+        # Trade execution is important - always log (not interval)
         self.logger.info(f"Executing trade: {condition_id[:10]}... {side} {size}@{price}")
 
         response = await self.publisher_manager.execute_trade(condition_id, side, size, price)
@@ -905,24 +1193,27 @@ class ArbitrageCoordinator:
             'success_rate_percent': success_rate,
             'trading_lane_active': self.opportunity_scanner is not None and self.opportunity_scanner.is_running,
             'storage_lane_active': self.database_publisher is not None and self.database_publisher.is_running,
-            'database_publisher_health': self.database_publisher.get_health_summary() if self.database_publisher else None
+            'database_publisher_health': self.database_publisher.get_health_summary() if self.database_publisher else None,
+            'interval_logging_stats': self.interval_logger.get_stats() if hasattr(self, 'interval_logger') else None
         }
 
 
 # Demo and testing
 async def run_enhanced_coordinator_demo():
-    """Demo the enhanced arbitrage coordinator with data bifurcation"""
-    print("ENHANCED ARBITRAGE COORDINATOR WITH DATA BIFURCATION DEMO")
-    print("=" * 70)
+    """Demo the enhanced arbitrage coordinator with data bifurcation, interval logging, and data flow monitoring"""
+    print("ENHANCED ARBITRAGE COORDINATOR WITH DATA BIFURCATION, INTERVAL LOGGING, AND DATA FLOW MONITORING DEMO")
+    print("=" * 100)
 
     try:
         async with ArbitrageCoordinator() as coordinator:
             print("✅ Enhanced coordinator started successfully!")
 
-            # Let it run for 60 seconds to test bifurcation
-            print("🔄 Running enhanced coordinator for 60 seconds...")
+            # Let it run for 90 seconds to test bifurcation, interval logging, and data flow monitoring
+            print("🔄 Running enhanced coordinator for 90 seconds...")
             print("   Monitoring data bifurcation to trading + storage lanes...")
-            await asyncio.sleep(60)
+            print("   Testing interval logging with sample messages...")
+            print("   Data flow monitoring will show status every 30 seconds...")
+            await asyncio.sleep(90)
 
             # Show enhanced status
             status = coordinator.get_status()
@@ -992,4 +1283,5 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             print("\nDemo interrupted by user")
         except Exception as e:
+            # noinspection PyPackageRequirements
             print(f"Demo execution failed: {e}")

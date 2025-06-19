@@ -156,9 +156,6 @@ class KalshiDataFeed:
         self.is_running = False
         self.stop_requested = False
 
-        # Timing thresholds
-        self.overrun_threshold_ms = 10.0  # Only warn if overrun > 10ms
-
         logger.info(f"Production Kalshi data feed initialized - update interval: {market_data_interval}s")
 
     async def __aenter__(self):
@@ -234,40 +231,40 @@ class KalshiDataFeed:
                     api_response_ns = time.time_ns()
 
                     # DEBUG LOGGING - Log raw API response
-                    logger.debug(f"RAW KALSHI API RESPONSE for {ticker}:")
-                    logger.debug(f"   Response type: {type(orderbook_response)}")
-                    logger.debug(
+                    logger.info(f"🔍 RAW KALSHI API RESPONSE for {ticker}:")
+                    logger.info(f"   Response type: {type(orderbook_response)}")
+                    logger.info(
                         f"   Response keys: {list(orderbook_response.keys()) if orderbook_response else 'None'}")
 
                     if orderbook_response and 'orderbook' in orderbook_response:
                         raw_orderbook = orderbook_response['orderbook']
-                        logger.debug(f"   Orderbook type: {type(raw_orderbook)}")
-                        logger.debug(f"   Orderbook keys: {list(raw_orderbook.keys()) if raw_orderbook else 'None'}")
+                        logger.info(f"   Orderbook type: {type(raw_orderbook)}")
+                        logger.info(f"   Orderbook keys: {list(raw_orderbook.keys()) if raw_orderbook else 'None'}")
 
                         # Log YES side structure
                         if 'yes' in raw_orderbook:
                             yes_data = raw_orderbook['yes']
-                            logger.debug(f"   YES side type: {type(yes_data)}")
-                            logger.debug(
+                            logger.info(f"   YES side type: {type(yes_data)}")
+                            logger.info(
                                 f"   YES side length: {len(yes_data) if isinstance(yes_data, list) else 'Not a list'}")
                             if isinstance(yes_data, list) and len(yes_data) > 0:
-                                logger.debug(f"   YES first item: {yes_data[0]}")
-                                logger.debug(f"   YES first item type: {type(yes_data[0])}")
+                                logger.info(f"   YES first item: {yes_data[0]}")
+                                logger.info(f"   YES first item type: {type(yes_data[0])}")
 
                         # Log NO side structure
                         if 'no' in raw_orderbook:
                             no_data = raw_orderbook['no']
-                            logger.debug(f"   NO side type: {type(no_data)}")
-                            logger.debug(
+                            logger.info(f"   NO side type: {type(no_data)}")
+                            logger.info(
                                 f"   NO side length: {len(no_data) if isinstance(no_data, list) else 'Not a list'}")
                             if isinstance(no_data, list) and len(no_data) > 0:
-                                logger.debug(f"   NO first item: {no_data[0]}")
-                                logger.debug(f"   NO first item type: {type(no_data[0])}")
+                                logger.info(f"   NO first item: {no_data[0]}")
+                                logger.info(f"   NO first item type: {type(no_data[0])}")
 
                         # Log complete raw orderbook (first few levels only)
-                        logger.debug(f"   Raw orderbook structure: {raw_orderbook}")
+                        logger.info(f"   Raw orderbook structure: {raw_orderbook}")
                     else:
-                        logger.warning(f"   No orderbook in response for {ticker}")
+                        logger.warning(f"   ❌ No orderbook in response for {ticker}")
 
                     if not orderbook_response or 'orderbook' not in orderbook_response:
                         return None
@@ -300,42 +297,41 @@ class KalshiDataFeed:
 
         # DEBUG LOGGING - Log processed data before sending to callbacks
         if current_data:
-            logger.debug(f"PROCESSED DATA BEFORE CALLBACKS:")
-            logger.debug(f"   Number of tickers processed: {len(current_data)}")
+            logger.info(f"🔄 PROCESSED DATA BEFORE CALLBACKS:")
+            logger.info(f"   Number of tickers processed: {len(current_data)}")
 
             for ticker, data in current_data.items():
-                logger.debug(f"   TICKER {ticker}:")
-                logger.debug(f"      Data type: {type(data)}")
-                logger.debug(f"      Data keys: {list(data.keys())}")
+                logger.info(f"   📊 TICKER {ticker}:")
+                logger.info(f"      Data type: {type(data)}")
+                logger.info(f"      Data keys: {list(data.keys())}")
 
                 # Check for timing fields
                 timing_fields = ['api_call_start_ns', 'api_response_ns', 'processing_complete_ns']
                 for field in timing_fields:
                     if field in data:
-                        logger.debug(f"      {field}: {data[field]}")
+                        logger.info(f"      {field}: {data[field]}")
 
                 # Check for orderbook structure
                 if 'yes' in data:
-                    logger.debug(
+                    logger.info(
                         f"      YES levels: {len(data['yes']) if isinstance(data['yes'], list) else 'Not a list'}")
                 if 'no' in data:
-                    logger.debug(
-                        f"      NO levels: {len(data['no']) if isinstance(data['no'], list) else 'Not a list'}")
+                    logger.info(f"      NO levels: {len(data['no']) if isinstance(data['no'], list) else 'Not a list'}")
 
                 # Log a subset of the data to avoid spam
                 data_subset = {k: v for k, v in data.items() if k in ['ticker', 'title', 'status', 'volume']}
-                logger.debug(f"      Basic fields: {data_subset}")
+                logger.info(f"      Basic fields: {data_subset}")
 
-            logger.debug(f"   Sending to {len(self.data_callbacks)} callbacks")
+            logger.info(f"   Sending to {len(self.data_callbacks)} callbacks")
 
         # Send to callbacks
         if current_data:
-            logger.debug(f"Sending {len(current_data)} markets to callbacks")
+            logger.info(f"Sending {len(current_data)} markets to callbacks")
 
             # Log all the data we're sending
             for ticker, data in current_data.items():
-                logger.debug(f"DATA FOR {ticker}:")
-                logger.debug(f"  Raw orderbook: {data}")
+                logger.info(f"DATA FOR {ticker}:")
+                logger.info(f"  Raw orderbook: {data}")
 
             for callback in self.data_callbacks:
                 try:
@@ -357,18 +353,15 @@ class KalshiDataFeed:
         """
         High-frequency data feed loop optimized for 1-second updates.
         """
-        logger.info("Starting high-frequency Kalshi data feed (1-second updates)...")
+        logger.info("🚀 Starting high-frequency Kalshi data feed (1-second updates)...")
         self.is_running = True
 
-        logger.info(f"Data feed configuration:")
+        logger.info(f"📊 Data feed configuration:")
         logger.info(f"   Update interval: {self.market_data_interval}s")
         logger.info(f"   Active tickers: {len(self.active_tickers)}")
         logger.info(f"   API calls per cycle: {len(self.active_tickers)}")
 
         loop_count = 0
-        total_overruns = 0
-        max_overrun_ms = 0
-
         while not self.stop_requested:
             try:
                 loop_count += 1
@@ -376,65 +369,32 @@ class KalshiDataFeed:
 
                 # Only fetch if we have active tickers
                 if self.active_tickers:
-                    logger.debug(f"Data cycle #{loop_count} starting...")
+                    logger.debug(f"🔄 Data cycle #{loop_count} starting...")
 
-                    # Time the data fetch separately
-                    fetch_start = time.time()
-                    market_data = await self.fetch_complete_market_data()
-                    fetch_duration = time.time() - fetch_start
+                    # Fetch all market data in parallel
+                    await self.fetch_complete_market_data()
 
                     cycle_duration = time.time() - cycle_start
-                    callback_duration = cycle_duration - fetch_duration
-
-                    logger.debug(f"Cycle #{loop_count} breakdown:")
-                    logger.debug(f"  API fetch: {fetch_duration:.3f}s")
-                    logger.debug(f"  Callbacks: {callback_duration:.3f}s")
-                    logger.debug(f"  Total: {cycle_duration:.3f}s")
+                    logger.debug(f"✅ Cycle #{loop_count} completed in {cycle_duration:.2f}s")
 
                     # Calculate sleep time to maintain target intervals
-                    sleep_time = self.market_data_interval - cycle_duration
+                    sleep_time = max(0, self.market_data_interval - cycle_duration)
 
                     if sleep_time > 0:
-                        logger.debug(f"Sleeping {sleep_time:.3f}s until next cycle")
+                        logger.debug(f"⏳ Sleeping {sleep_time:.2f}s until next cycle")
                         await asyncio.sleep(sleep_time)
                     else:
-                        # Only warn if overrun is significant (> 10ms)
-                        overrun_ms = abs(sleep_time) * 1000
-                        if overrun_ms > self.overrun_threshold_ms:
-                            total_overruns += 1
-                            max_overrun_ms = max(max_overrun_ms, overrun_ms)
-
-                            logger.warning(f"Cycle overran by {overrun_ms:.1f}ms")
-                            logger.warning(f"  Fetch time: {fetch_duration:.3f}s")
-                            logger.warning(f"  Callback time: {callback_duration:.3f}s")
-                            logger.warning(f"  Tickers processed: {len(market_data)}")
-
-                            # Performance suggestions based on timing
-                            if fetch_duration > 0.8:
-                                logger.warning("  Consider reducing semaphore limit or splitting ticker batches")
-                            if callback_duration > 0.2:
-                                logger.warning("  Callback processing is slow - check callback efficiency")
-
-                        else:
-                            logger.debug(f"Minor cycle overrun: {overrun_ms:.2f}ms (within threshold)")
+                        logger.warning(f"⚠️  Cycle overran by {-sleep_time:.2f}s!")
 
                 else:
-                    logger.debug("No active tickers, sleeping...")
+                    logger.debug("⏸️  No active tickers, sleeping...")
                     await asyncio.sleep(self.market_data_interval)
 
-                # Log performance stats every 60 cycles (roughly 1 minute)
-                if loop_count % 60 == 0 and total_overruns > 0:
-                    overrun_rate = (total_overruns / loop_count) * 100
-                    logger.info(f"Performance stats after {loop_count} cycles:")
-                    logger.info(f"  Overrun rate: {overrun_rate:.1f}% ({total_overruns}/{loop_count})")
-                    logger.info(f"  Max overrun: {max_overrun_ms:.1f}ms")
-                    logger.info(f"  Active tickers: {len(self.active_tickers)}")
-
             except Exception as e:
-                logger.error(f"Error in data feed loop #{loop_count}: {e}")
+                logger.error(f"💥 Error in data feed loop #{loop_count}: {e}")
                 await asyncio.sleep(1)  # Brief pause on error
 
-        logger.info("High-frequency Kalshi data feed stopped")
+        logger.info("🛑 High-frequency Kalshi data feed stopped")
         self.is_running = False
 
     def stop(self):

@@ -20,6 +20,20 @@ load_dotenv(env_path)
 
 
 @dataclass
+class DatabaseConfig:
+    """Database configuration for PostgreSQL connection"""
+    host: str
+    port: int
+    name: str
+    user: str
+    password: str
+    connection_timeout: int
+    max_connections: int
+    retry_attempts: int
+    retry_delay: float
+
+
+@dataclass
 class PolymarketConfig:
     """Polymarket API configuration"""
     # API endpoints
@@ -96,6 +110,7 @@ class TradingConfig:
 @dataclass
 class IrelandConfig:
     """Main Ireland server configuration"""
+    database: DatabaseConfig
     polymarket: PolymarketConfig
     zeromq: ZeroMQConfig
     trading: TradingConfig
@@ -162,6 +177,19 @@ def load_config() -> IrelandConfig:
         ValueError: If required configuration is missing or invalid
     """
     try:
+        # Database configuration
+        database = DatabaseConfig(
+            host=get_env_var('DB_HOST', 'localhost', required=False),
+            port=get_env_int('DB_PORT', 5432, required=False),
+            name=get_env_var('DB_NAME', 'arb_trading', required=False),
+            user=get_env_var('DB_USER', 'postgres', required=False),
+            password=get_env_var('DB_PASSWORD', required=True),
+            connection_timeout=get_env_int('DB_CONNECTION_TIMEOUT', 30, required=False),
+            max_connections=get_env_int('DB_MAX_CONNECTIONS', 10, required=False),
+            retry_attempts=get_env_int('DB_RETRY_ATTEMPTS', 3, required=False),
+            retry_delay=get_env_float('DB_RETRY_DELAY', 1.0, required=False)
+        )
+
         # Polymarket configuration
         polymarket = PolymarketConfig(
             # API endpoints
@@ -234,6 +262,7 @@ def load_config() -> IrelandConfig:
 
         # Main configuration
         config = IrelandConfig(
+            database=database,
             polymarket=polymarket,
             zeromq=zeromq,
             trading=trading,
@@ -259,6 +288,11 @@ except Exception as e:
 
 
 # Convenience functions
+def get_database_config() -> DatabaseConfig:
+    """Get database configuration"""
+    return CONFIG.database
+
+
 def get_polymarket_config() -> PolymarketConfig:
     """Get Polymarket configuration"""
     return CONFIG.polymarket
@@ -295,8 +329,11 @@ if __name__ == "__main__":
 
     try:
         config = load_config()
-        print(f"✅ Configuration loaded successfully")
+        print(f"Configuration loaded successfully")
         print(f"Environment: {config.environment}")
+        print(f"Database: {config.database.host}:{config.database.port}/{config.database.name}")
+        print(f"Database user: {config.database.user}")
+        print(f"Database password: {'SET' if config.database.password else 'NOT SET'}")
         print(f"Polymarket CLOB: {config.polymarket.clob_host}")
         print(f"Polymarket Gamma: {config.polymarket.gamma_host}")
         print(f"Polymarket API key: {'SET' if config.polymarket.api_key else 'NOT SET'}")
@@ -310,13 +347,23 @@ if __name__ == "__main__":
         print(f"Batch size: {config.polymarket.batch_size}")
 
     except Exception as e:
-        print(f"❌ Configuration loading failed: {e}")
+        print(f"Configuration loading failed: {e}")
         print("\nMake sure you have a .env file with required variables:")
+        print("# Database configuration")
+        print("DB_HOST=localhost")
+        print("DB_PORT=5432")
+        print("DB_NAME=arb_trading")
+        print("DB_USER=your_username")
+        print("DB_PASSWORD=your_password")
+        print("")
+        print("# Polymarket configuration")
         print("POLYMARKET_CLOB_HOST=https://clob.polymarket.com")
         print("POLYMARKET_GAMMA_HOST=https://gamma-api.polymarket.com")
         print("POLYMARKET_API_KEY=your_api_key")
         print("POLYMARKET_API_SECRET=your_api_secret")
         print("POLYMARKET_API_PASSPHRASE=your_passphrase")
         print("POLY_KEY=your_private_key")
+        print("")
+        print("# ZeroMQ configuration")
         print("ZEROMQ_VIRGINIA_ENDPOINT=tcp://virginia-ip:5555")
         print("# ... and other configuration variables")

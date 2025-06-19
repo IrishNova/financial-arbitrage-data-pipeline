@@ -5,6 +5,8 @@ broker/database_publisher.py
 ZeroMQ publisher for Virginia server to Database server.
 Sends market data, analysis records, and trade data for storage.
 Three separate streams for different data types.
+
+FIXED: Uses IntervalLogger for high-frequency data instead of flooding with DEBUG logs.
 """
 
 import sys
@@ -24,7 +26,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from utils.config import CONFIG
-from utils.logger import get_logger
+from utils.logger import get_logger, get_interval_logger
 
 
 @dataclass
@@ -66,12 +68,17 @@ class DatabasePublisher:
     """
     ZeroMQ publisher for Virginia → Database server communication.
     Handles three separate data streams for efficient database storage.
+
+    FIXED: Uses IntervalLogger for high-frequency data messages.
     """
 
-    def __init__(self, verbose: bool = False):
+    def __init__(self):
         """Initialize Database ZeroMQ publisher"""
+        # Regular logger for system events (startup, shutdown, errors)
         self.logger = get_logger('database_publisher')
-        self.verbose = verbose
+
+        # Interval logger for high-frequency data operations
+        self.interval_logger = get_interval_logger('database_publisher')
 
         # ZeroMQ context and sockets
         self.context = zmq.asyncio.Context()
@@ -80,6 +87,7 @@ class DatabasePublisher:
         self.trade_socket: Optional[zmq.asyncio.Socket] = None
 
         # Connection endpoints - Virginia pushes to Database server
+        # USE CONFIG INSTEAD OF HARDCODED VALUES
         database_host = CONFIG.zeromq.database.host
         market_data_port = CONFIG.zeromq.database.market_data_port
         analysis_data_port = CONFIG.zeromq.database.analysis_data_port
@@ -106,13 +114,10 @@ class DatabasePublisher:
             'polymarket_snapshots_sent': 0
         }
 
-        if self.verbose:
-            self.logger.info(
-                f"Database ZeroMQ publisher initialized with VERBOSE logging - Server ID: {self.virginia_server_id}")
-            self.logger.info(
-                f"Database endpoints: {self.market_data_endpoint}, {self.analysis_endpoint}, {self.trade_endpoint}")
-        else:
-            self.logger.info(f"Database ZeroMQ publisher initialized - Server ID: {self.virginia_server_id}")
+        # System startup logs (always show)
+        self.logger.info(f"Database ZeroMQ publisher initialized - Server ID: {self.virginia_server_id}")
+        self.logger.info(
+            f"Database endpoints: {self.market_data_endpoint}, {self.analysis_endpoint}, {self.trade_endpoint}")
 
     async def __aenter__(self):
         """Async context manager entry"""
@@ -189,65 +194,86 @@ class DatabasePublisher:
     def _serialize_message(self, message: Any) -> bytes:
         """Serialize message to MessagePack"""
         try:
-            if self.verbose:
-                self.logger.debug(f"Serializing message type: {type(message)}")
-
             if hasattr(message, '__dict__'):
                 data = asdict(message)
-                if self.verbose:
-                    self.logger.debug(f"Converted dataclass to dict, keys: {list(data.keys())}")
             else:
                 data = message
 
-            # Verbose logging for market data
-            if self.verbose and isinstance(data, dict) and 'snapshots' in data:
-                snapshots = data['snapshots']
-                self.logger.debug(f"Message contains {len(snapshots)} snapshots")
-                if snapshots:
-                    first_snapshot = snapshots[0]
-
-                    # Check full_orderbook specifically
-                    if 'full_orderbook' in first_snapshot:
-                        full_orderbook = first_snapshot['full_orderbook']
-                        if isinstance(full_orderbook, dict):
-                            yes_levels = len(full_orderbook.get('yes', []))
-                            no_levels = len(full_orderbook.get('no', []))
-                            self.logger.debug(f"Full orderbook: {yes_levels} YES, {no_levels} NO levels")
+            # Use interval logger for serialization details
+            self.interval_logger.debug(
+                'serialization',
+                f'Serializing message type: {type(message).__name__}',
+                {
+                    'message_type': type(message).__name__,
+                    'data_keys': list(data.keys()) if isinstance(data, dict) else 'not_dict',
+                    'snapshots_count': len(data.get('snapshots', [])) if isinstance(data, dict) else 0,
+                    'message_size_estimate': len(str(data))
+                }
+            )
 
             packed_data = msgpack.packb(data, use_bin_type=True)
 
-            if self.verbose:
-                self.logger.debug(f"MessagePack serialization successful: {len(packed_data)} bytes")
+            # Use interval logger for serialization success
+            self.interval_logger.debug(
+                'serialization_success',
+                f'MessagePack serialization successful: {len(packed_data)} bytes',
+                {
+                    'packed_size_bytes': len(packed_data),
+                    'compression_ratio': len(str(data)) / len(packed_data) if len(packed_data) > 0 else 0
+                }
+            )
 
             return packed_data
 
         except Exception as e:
+            # Errors always show
             self.logger.error(f"Failed to serialize message: {e}")
-            if self.verbose:
-                import traceback
-                self.logger.error(f"Traceback: {traceback.format_exc()}")
             raise
 
     async def _send_with_retry(self, socket: zmq.asyncio.Socket, message_bytes: bytes,
                                max_retries: int = 3) -> bool:
         """Send message with retry logic"""
-        if self.verbose:
-            self.logger.debug(f"Sending {len(message_bytes)} bytes with retry")
+        # Use interval logger for send attempts
+        self.interval_logger.debug(
+            'socket_send',
+            f'Attempting to send {len(message_bytes)} bytes',
+            {
+                'message_size_bytes': len(message_bytes),
+                'max_retries': max_retries,
+                'socket_type': str(socket.socket_type)
+            }
+        )
 
         for attempt in range(max_retries):
             try:
                 await socket.send(message_bytes, zmq.NOBLOCK)
 
-                if self.verbose:
-                    self.logger.debug(f"Message sent successfully on attempt {attempt + 1}")
+                # Use interval logger for send success
+                self.interval_logger.debug(
+                    'socket_send_success',
+                    f'Message sent successfully on attempt {attempt + 1}',
+                    {
+                        'attempt_number': attempt + 1,
+                        'message_size_bytes': len(message_bytes),
+                        'total_messages_sent': self.stats['total_messages_sent'] + 1
+                    }
+                )
 
                 self.stats['total_messages_sent'] += 1
                 self.stats['last_send_time'] = time.time()
                 return True
 
             except zmq.Again:
-                if self.verbose:
-                    self.logger.warning(f"Socket would block on attempt {attempt + 1}")
+                # Socket blocking - use interval logger
+                self.interval_logger.debug(
+                    'socket_block',
+                    f'Socket would block on attempt {attempt + 1}',
+                    {
+                        'attempt_number': attempt + 1,
+                        'max_retries': max_retries,
+                        'will_retry': attempt < max_retries - 1
+                    }
+                )
 
                 if attempt < max_retries - 1:
                     sleep_time = 0.001 * (2 ** attempt)
@@ -257,6 +283,7 @@ class DatabasePublisher:
                     self.logger.warning("Socket send would block after retries")
 
             except Exception as e:
+                # Errors always show
                 self.logger.error(f"Failed to send message (attempt {attempt + 1}): {e}")
                 self.stats['send_errors'] += 1
                 if attempt < max_retries - 1:
@@ -277,32 +304,39 @@ class DatabasePublisher:
             True if sent successfully
         """
         if not self.is_running or not self.market_data_socket or not snapshots:
-            if self.verbose:
-                self.logger.debug(f"Market data send precondition failed: "
-                                  f"running={self.is_running}, socket={self.market_data_socket is not None}, "
-                                  f"snapshots={bool(snapshots)}")
             return False
 
         try:
-            # Verbose logging for first snapshot analysis
-            if self.verbose and snapshots:
-                first_snapshot = snapshots[0]
-                self.logger.debug(f"Sending {source} batch: {len(snapshots)} snapshots")
-                self.logger.debug(f"First snapshot: {first_snapshot.get('ticker', 'unknown')} "
-                                  f"ID: {first_snapshot.get('snapshot_id', 'unknown')[:12]}...")
+            # Use interval logger for market data processing
+            first_snapshot = snapshots[0] if snapshots else {}
 
-                # Check orderbook structure
-                full_orderbook = first_snapshot.get('full_orderbook')
-                if isinstance(full_orderbook, dict):
-                    yes_levels = len(full_orderbook.get('yes', []))
-                    no_levels = len(full_orderbook.get('no', []))
-                    self.logger.debug(f"Orderbook depth: {yes_levels} YES, {no_levels} NO levels")
+            self.interval_logger.debug(
+                'market_data_processing',
+                f'Processing {source} market data batch: {len(snapshots)} snapshots',
+                {
+                    'source': source,
+                    'snapshots_count': len(snapshots),
+                    'first_snapshot': {
+                        'snapshot_id': first_snapshot.get('snapshot_id', 'missing'),
+                        'ticker': first_snapshot.get('ticker', 'missing'),
+                        'yes_bid': first_snapshot.get('yes_bid'),
+                        'yes_ask': first_snapshot.get('yes_ask'),
+                        'no_bid': first_snapshot.get('no_bid'),
+                        'no_ask': first_snapshot.get('no_ask'),
+                        'full_orderbook_keys': list(first_snapshot.get('full_orderbook', {}).keys()) if isinstance(
+                            first_snapshot.get('full_orderbook'), dict) else 'not_dict',
+                        'full_orderbook_size': len(str(first_snapshot.get('full_orderbook', {}))),
+                        'virginia_received_ns': first_snapshot.get('virginia_received_ns'),
+                        'processing_timestamp': first_snapshot.get('processing_timestamp')
+                    }
+                }
+            )
 
-            # Add Virginia send timestamp
+            # Add Virginia send timestamp (UTC)
             virginia_sent_timestamp_ns = time.time_ns()
 
             # Add Virginia timestamps to each snapshot
-            for snapshot in snapshots:
+            for i, snapshot in enumerate(snapshots):
                 snapshot['virginia_sent_to_data_server_ns'] = virginia_sent_timestamp_ns
 
             message = MarketDataMessage(
@@ -324,21 +358,27 @@ class DatabasePublisher:
                 elif source == "polymarket":
                     self.stats['polymarket_snapshots_sent'] += len(snapshots)
 
-                # Log at appropriate level
-                if self.verbose:
-                    self.logger.debug(f"Sent {source} market data batch: {len(snapshots)} snapshots")
-                elif len(snapshots) > 10:  # Only log large batches in production
-                    self.logger.debug(f"Sent large {source} batch: {len(snapshots)} snapshots")
+                # Use interval logger for success summary
+                self.interval_logger.debug(
+                    'market_data_success',
+                    f'Successfully sent {source} market data batch',
+                    {
+                        'source': source,
+                        'snapshots_sent': len(snapshots),
+                        'total_market_data_sent': self.stats['market_data_sent'],
+                        'total_snapshots_sent': self.stats.get(f'{source}_snapshots_sent', 0),
+                        'message_id': message.message_id
+                    }
+                )
             else:
+                # Errors always show
                 self.logger.error(f"Failed to send {source} market data batch: {len(snapshots)} snapshots")
 
             return success
 
         except Exception as e:
+            # Errors always show
             self.logger.error(f"Error sending {source} market data: {e}")
-            if self.verbose:
-                import traceback
-                self.logger.error(f"Traceback: {traceback.format_exc()}")
             self.stats['send_errors'] += 1
             return False
 
@@ -369,20 +409,40 @@ class DatabasePublisher:
                 message_id=f"analysis-{uuid.uuid4().hex[:12]}"
             )
 
+            # Use interval logger for analysis data
+            self.interval_logger.debug(
+                'analysis_data',
+                f'Sending analysis update for snapshot {snapshot_id[:8]}...',
+                {
+                    'snapshot_id_short': snapshot_id[:16] + "..." if len(snapshot_id) > 16 else snapshot_id,
+                    'analyzed': analyzed,
+                    'executed': executed,
+                    'message_id': message.message_id
+                }
+            )
+
             message_bytes = self._serialize_message(message)
             success = await self._send_with_retry(self.analysis_socket, message_bytes)
 
             if success:
                 self.stats['analysis_data_sent'] += 1
-                if self.verbose:
-                    self.logger.debug(f"Sent analysis update: {snapshot_id[:8]}... "
-                                      f"analyzed={analyzed}, executed={executed}")
+                # Use interval logger for success
+                self.interval_logger.debug(
+                    'analysis_success',
+                    f'Analysis update sent successfully',
+                    {
+                        'snapshot_id_short': snapshot_id[:16] + "..." if len(snapshot_id) > 16 else snapshot_id,
+                        'total_analysis_sent': self.stats['analysis_data_sent']
+                    }
+                )
             else:
+                # Errors always show
                 self.logger.error(f"Failed to send analysis update: {snapshot_id[:8]}...")
 
             return success
 
         except Exception as e:
+            # Errors always show
             self.logger.error(f"Error sending analysis data: {e}")
             self.stats['send_errors'] += 1
             return False
@@ -415,19 +475,26 @@ class DatabasePublisher:
                 message_id=f"trade-{uuid.uuid4().hex[:12]}"
             )
 
+            trade_id = trade_ticket.get('trade_id', 'unknown')
+
+            # Trade data is important - always log (not interval)
+            self.logger.info(f"Sending trade data: {trade_id}")
+
             message_bytes = self._serialize_message(message)
             success = await self._send_with_retry(self.trade_socket, message_bytes)
 
             if success:
                 self.stats['trade_data_sent'] += 1
-                trade_id = trade_ticket.get('trade_id', 'unknown')
-                self.logger.info(f"Sent trade data: {trade_id}")  # Always log trades
+                # Trade success is important - always log
+                self.logger.info(f"Sent trade data: {trade_id}")
             else:
-                self.logger.error(f"Failed to send trade data: {trade_ticket.get('trade_id', 'unknown')}")
+                # Errors always show
+                self.logger.error(f"Failed to send trade data: {trade_id}")
 
             return success
 
         except Exception as e:
+            # Errors always show
             self.logger.error(f"Error sending trade data: {e}")
             self.stats['send_errors'] += 1
             return False
@@ -446,7 +513,6 @@ class DatabasePublisher:
         return {
             "is_running": self.is_running,
             "virginia_server_id": self.virginia_server_id,
-            "verbose_mode": self.verbose,
             "statistics": self.stats.copy(),
             "performance": {
                 "messages_per_minute": messages_per_minute,
@@ -456,7 +522,9 @@ class DatabasePublisher:
                 "market_data": self.market_data_endpoint,
                 "analysis": self.analysis_endpoint,
                 "trade": self.trade_endpoint
-            }
+            },
+            # NEW: Interval logger stats
+            "interval_logging": self.interval_logger.get_stats() if hasattr(self, 'interval_logger') else None
         }
 
     def get_health_summary(self) -> Dict[str, Any]:
@@ -475,55 +543,66 @@ class DatabasePublisher:
             "kalshi_snapshots_sent": self.stats['kalshi_snapshots_sent'],
             "polymarket_snapshots_sent": self.stats['polymarket_snapshots_sent'],
             "send_errors": self.stats['send_errors'],
-            "last_send_time": self.stats.get('last_send_time', 0)
+            "last_send_time": self.stats.get('last_send_time', 0),
+            # NEW: Interval logger stats
+            "interval_stats": self.interval_logger.get_stats() if hasattr(self, 'interval_logger') else None
         }
 
 
 # Demo and testing
 async def test_database_publisher():
-    """Test Database ZeroMQ publisher"""
-    print("DATABASE ZEROMQ PUBLISHER TEST")
-    print("=" * 50)
+    """Test Database ZeroMQ publisher with interval logging"""
+    print("DATABASE ZEROMQ PUBLISHER TEST WITH INTERVAL LOGGING")
+    print("=" * 60)
 
     try:
-        async with DatabasePublisher(verbose=True) as publisher:
+        async with DatabasePublisher() as publisher:
             print("Database ZeroMQ publisher started")
 
-            # Test Kalshi market data sending
-            kalshi_snapshots = [
-                {
-                    "snapshot_id": f"kalshi-{uuid.uuid4().hex[:8]}",
-                    "source": "kalshi",
-                    "ticker": "TEST-KALSHI",
-                    "yes_bid": 0.45,
-                    "yes_ask": 0.47,
-                    "no_bid": 0.53,
-                    "no_ask": 0.55,
-                    "full_orderbook": {
-                        "yes": [[45, 1000], [46, 500]],
-                        "no": [[55, 800], [56, 400]]
-                    },
-                    "api_call_start_ns": time.time_ns() - 1000000,
-                    "api_response_ns": time.time_ns() - 500000,
-                    "processing_complete_ns": time.time_ns(),
-                    "virginia_received_ns": time.time_ns(),
-                    "virginia_enriched_ns": time.time_ns()
-                }
-            ]
+            # Test high-frequency market data sending to trigger interval logging
+            print("Testing high-frequency market data to trigger interval logging...")
 
-            print("Testing Kalshi market data send...")
-            success = await publisher.send_market_data("kalshi", kalshi_snapshots)
-            print(f"Kalshi market data send result: {success}")
+            for i in range(1200):  # Send more than LOG_SAMPLE_INTERVAL to see samples
+                kalshi_snapshots = [
+                    {
+                        "snapshot_id": f"kalshi-{uuid.uuid4().hex[:8]}-{i}",
+                        "source": "kalshi",
+                        "ticker": f"TEST-KALSHI-{i}",
+                        "yes_bid": 0.45 + (i * 0.001),
+                        "yes_ask": 0.47 + (i * 0.001),
+                        "no_bid": 0.53 - (i * 0.001),
+                        "no_ask": 0.55 - (i * 0.001),
+                        "full_orderbook": {
+                            "yes": [[45 + i, 1000], [46 + i, 500]],
+                            "no": [[55 - i, 800], [56 - i, 400]],
+                            "ticker": f"TEST-KALSHI-{i}",
+                            "volume": i * 10
+                        },
+                        "api_call_start_ns": time.time_ns() - 1000000,
+                        "api_response_ns": time.time_ns() - 500000,
+                        "processing_complete_ns": time.time_ns(),
+                        "virginia_received_ns": time.time_ns(),
+                        "virginia_enriched_ns": time.time_ns()
+                    }
+                ]
 
-            # Show status
+                success = await publisher.send_market_data("kalshi", kalshi_snapshots)
+
+                if i % 100 == 0:
+                    print(f"Sent {i} market data batches...")
+
+            # Show final status
             status = publisher.get_status()
-            print(f"\nPublisher Status:")
+            print(f"\nFinal Publisher Status:")
             print(f"  Running: {status['is_running']}")
             print(f"  Total messages sent: {status['statistics']['total_messages_sent']}")
             print(f"  Market data sent: {status['statistics']['market_data_sent']}")
             print(f"  Send errors: {status['statistics']['send_errors']}")
 
-            print("Database publisher test completed!")
+            if status.get('interval_logging'):
+                print(f"  Interval logging stats: {status['interval_logging']}")
+
+            print("Database publisher interval logging test completed!")
 
     except Exception as e:
         print(f"Database publisher test failed: {e}")

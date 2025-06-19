@@ -4,6 +4,9 @@ broker/receiver.py
 
 High-performance ZeroMQ receiver for Virginia server.
 Receives market data, trade fills, and metrics from Ireland server.
+
+FIXED: Changed from connect() to bind() for Ireland communication.
+FIXED: Corrected field mapping for Polymarket data from Ireland.
 """
 
 import sys
@@ -83,6 +86,8 @@ class ZeroMQReceiver:
     1. Market Data (Polymarket prices/orderbooks)
     2. Trade Fills (execution confirmations)
     3. System Metrics (health/performance data)
+
+    FIXED: Virginia now binds (listens) for Ireland to connect.
     """
 
     def __init__(self):
@@ -95,20 +100,15 @@ class ZeroMQReceiver:
         self.fills_socket: Optional[zmq.asyncio.Socket] = None
         self.metrics_socket: Optional[zmq.asyncio.Socket] = None
 
-        # Connection endpoints - Ireland pushes, Virginia pulls
-        try:
-            ireland_host = CONFIG.zeromq.ireland_endpoint.split('//')[1].split(':')[0]
-        except:
-            ireland_host = "localhost"  # Fallback for testing
+        # FIXED: Get ports directly from config for binding
+        marketdata_port = getattr(CONFIG.zeromq, 'marketdata_pull_port', 5556)
+        fills_port = getattr(CONFIG.zeromq, 'fills_pull_port', 5558)
+        metrics_port = getattr(CONFIG.zeromq, 'metrics_pull_port', 5559)
 
-        # Use config values or fallback to defaults for testing
-        marketdata_port = getattr(CONFIG.zeromq, 'marketdata_push_port', 5556)
-        fills_port = getattr(CONFIG.zeromq, 'fills_push_port', 5558)
-        metrics_port = getattr(CONFIG.zeromq, 'metrics_push_port', 5559)
-
-        self.marketdata_endpoint = f"tcp://{ireland_host}:{marketdata_port}"
-        self.fills_endpoint = f"tcp://{ireland_host}:{fills_port}"
-        self.metrics_endpoint = f"tcp://{ireland_host}:{metrics_port}"
+        # FIXED: Virginia binds (listens) on these addresses for Ireland to connect
+        self.marketdata_bind_address = f"tcp://0.0.0.0:{marketdata_port}"
+        self.fills_bind_address = f"tcp://0.0.0.0:{fills_port}"
+        self.metrics_bind_address = f"tcp://0.0.0.0:{metrics_port}"
 
         # State tracking
         self.is_running = False
@@ -132,6 +132,7 @@ class ZeroMQReceiver:
         }
 
         self.logger.info("ZeroMQ receiver initialized")
+        self.logger.info(f"Will bind to: {marketdata_port}, {fills_port}, {metrics_port}")
 
     async def __aenter__(self):
         """Async context manager entry"""
@@ -162,32 +163,34 @@ class ZeroMQReceiver:
             self.metrics_socket.setsockopt(zmq.RCVHWM, 1000)
             self.metrics_socket.setsockopt(zmq.LINGER, 0)
 
-            # Connect to Ireland endpoints (will work when Ireland server is running)
+            # FIXED: Bind (listen) for Ireland to connect to Virginia
             try:
-                self.marketdata_socket.connect(self.marketdata_endpoint)
-                self.logger.info(f"Market data receiver connected to {self.marketdata_endpoint}")
+                self.marketdata_socket.bind(self.marketdata_bind_address)
+                self.logger.info(f"✅ Market data receiver bound to {self.marketdata_bind_address}")
             except Exception as e:
-                self.logger.warning(f"Could not connect to Ireland market data: {e} (normal for testing)")
+                self.logger.error(f"❌ Could not bind market data socket: {e}")
+                raise
 
             try:
-                self.fills_socket.connect(self.fills_endpoint)
-                self.logger.info(f"Fills receiver connected to {self.fills_endpoint}")
+                self.fills_socket.bind(self.fills_bind_address)
+                self.logger.info(f"✅ Fills receiver bound to {self.fills_bind_address}")
             except Exception as e:
-                self.logger.warning(f"Could not connect to Ireland fills: {e} (normal for testing)")
+                self.logger.error(f"❌ Could not bind fills socket: {e}")
+                raise
 
             try:
-                self.metrics_socket.connect(self.metrics_endpoint)
-                self.logger.info(f"Metrics receiver connected to {self.metrics_endpoint}")
+                self.metrics_socket.bind(self.metrics_bind_address)
+                self.logger.info(f"✅ Metrics receiver bound to {self.metrics_bind_address}")
             except Exception as e:
-                self.logger.warning(f"Could not connect to Ireland metrics: {e} (normal for testing)")
+                self.logger.error(f"❌ Could not bind metrics socket: {e}")
+                raise
 
             self.is_running = True
-            self.logger.info("ZeroMQ receiver started successfully")
+            self.logger.info("✅ ZeroMQ receiver started - listening for Ireland connections")
 
         except Exception as e:
-            self.logger.error(f"Failed to start ZeroMQ receiver: {e}")
-            self.logger.warning("Receiver startup failed - this is expected during testing without Ireland server")
-            self.is_running = True  # Allow testing to continue
+            self.logger.error(f"❌ Failed to start ZeroMQ receiver: {e}")
+            raise
 
     async def stop(self):
         """Stop ZeroMQ receiver gracefully"""
@@ -250,6 +253,7 @@ class ZeroMQReceiver:
     async def _handle_marketdata_message(self, message_data: Dict[str, Any]):
         """
         Handle incoming market data message from Ireland.
+        FIXED: Corrected field mapping for Polymarket data.
 
         Args:
             message_data: Deserialized market data message
@@ -263,15 +267,27 @@ class ZeroMQReceiver:
                 for update in message_data.get('updates', []):
                     condition_id = update.get('condition_id')
                     if condition_id:
+                        # FIXED: Map Ireland's field names to Virginia's expected format
+                        # Ireland sends: best_bid, best_ask, bids, asks
+                        # Virginia expects: yes_price, no_price for PolymarketData
                         marketdata = PolymarketData(
                             condition_id=condition_id,
-                            title=update.get('title', ''),
-                            yes_price=update.get('yes_price', 0.0),
-                            no_price=update.get('no_price', 0.0),
+                            title=update.get('question', update.get('title', '')),
+                            yes_price=update.get('best_bid', 0.0),  # FIXED: was 'yes_price'
+                            no_price=update.get('best_ask', 0.0),   # FIXED: was 'no_price'
                             volume=update.get('volume', 0.0),
                             liquidity=update.get('liquidity', 0.0),
                             timestamp=update.get('timestamp', time.time()),
-                            orderbook=update.get('orderbook')
+                            orderbook={
+                                'bids': update.get('bids', []),
+                                'asks': update.get('asks', []),
+                                'best_bid': update.get('best_bid', 0.0),
+                                'best_ask': update.get('best_ask', 0.0),
+                                'bid_levels': update.get('bid_levels', 0),
+                                'ask_levels': update.get('ask_levels', 0),
+                                'spread': update.get('spread', 0.0),
+                                'midpoint': update.get('midpoint', 0.0)
+                            }
                         )
                         marketdata_updates[condition_id] = marketdata
 
@@ -279,7 +295,12 @@ class ZeroMQReceiver:
                     self.stats['marketdata_received'] += len(marketdata_updates)
                     self.last_data_received = time.time()
 
-                    self.logger.debug(f"Received market data for {len(marketdata_updates)} condition IDs")
+                    self.logger.info(f"✅ Received market data for {len(marketdata_updates)} condition IDs from Ireland")
+
+                    # DEBUG: Check callback flow
+                    print(f"🔍 SENDING TO {len(self.marketdata_callbacks)} CALLBACKS: {list(marketdata_updates.keys())}")
+                    for condition_id, data in marketdata_updates.items():
+                        print(f"🔍 DATA SAMPLE: {condition_id[:10]}... YES=${data.yes_price:.3f} NO=${data.no_price:.3f}")
 
                     # Send to callbacks
                     await self._notify_marketdata_callbacks(marketdata_updates)
@@ -326,7 +347,7 @@ class ZeroMQReceiver:
 
                 self.stats['fills_received'] += 1
                 self.logger.info(
-                    f"Received trade fill: {fill.condition_id[:10]}... {fill.side} {fill.size}@{fill.price}")
+                    f"✅ Received trade fill: {fill.condition_id[:10]}... {fill.side} {fill.size}@{fill.price}")
 
                 # Send to callbacks
                 await self._notify_fills_callbacks(fill)
@@ -354,8 +375,8 @@ class ZeroMQReceiver:
                 )
 
                 self.stats['metrics_received'] += 1
-                self.logger.debug(f"Received system metrics: {metrics.polymarket_api_status} - "
-                                  f"{metrics.api_latency_ms:.1f}ms latency")
+                self.logger.info(
+                    f"✅ Received system metrics: {metrics.polymarket_api_status} - {metrics.api_latency_ms:.1f}ms latency")
 
                 # Send to callbacks
                 await self._notify_metrics_callbacks(metrics)
@@ -365,13 +386,17 @@ class ZeroMQReceiver:
 
     async def _notify_marketdata_callbacks(self, marketdata: Dict[str, PolymarketData]):
         """Notify all market data callbacks"""
-        for callback in self.marketdata_callbacks:
+        print(f"🔍 NOTIFYING {len(self.marketdata_callbacks)} CALLBACKS")
+        for i, callback in enumerate(self.marketdata_callbacks):
             try:
+                print(f"🔍 CALLING CALLBACK #{i}: {callback.__name__}")
                 if asyncio.iscoroutinefunction(callback):
                     await callback(marketdata)
                 else:
                     callback(marketdata)
+                print(f"🔍 CALLBACK #{i} SUCCESS")
             except Exception as e:
+                print(f"🔍 CALLBACK #{i} ERROR: {e}")
                 self.logger.error(f"Error in market data callback {callback.__name__}: {e}")
 
     async def _notify_fills_callbacks(self, fill: TradeFill):
@@ -448,6 +473,7 @@ class ZeroMQReceiver:
     def add_marketdata_callback(self, callback: Callable[[Dict[str, PolymarketData]], None]):
         """Add callback for market data updates"""
         self.marketdata_callbacks.append(callback)
+        print(f"🔍 POLYMARKET CALLBACK REGISTERED: {callback.__name__} (Total: {len(self.marketdata_callbacks)})")
         self.logger.info(f"Added market data callback: {callback.__name__}")
 
     def add_fills_callback(self, callback: Callable[[TradeFill], None]):
@@ -489,10 +515,10 @@ class ZeroMQReceiver:
                 "metrics": len(self.metrics_callbacks),
                 "errors": len(self.error_callbacks)
             },
-            "endpoints": {
-                "marketdata": self.marketdata_endpoint,
-                "fills": self.fills_endpoint,
-                "metrics": self.metrics_endpoint
+            "bind_addresses": {
+                "marketdata": self.marketdata_bind_address,
+                "fills": self.fills_bind_address,
+                "metrics": self.metrics_bind_address
             }
         }
 
